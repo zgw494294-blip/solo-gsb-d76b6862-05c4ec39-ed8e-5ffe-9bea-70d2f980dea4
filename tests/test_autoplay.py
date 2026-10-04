@@ -14,6 +14,7 @@
 """
 import threading
 import time
+from decimal import Decimal
 
 import pytest
 
@@ -660,6 +661,429 @@ def test_deterministic_manual_advance_409_only_while_running():
         # blocked 不阻止手动推进；但整批放不下仍按 503 失败，游标不变
         pm2.advance_events(b, 200)
     assert b.cursor_ms == 100
+
+
+# ---------------------------------------------------------------------------
+# 锁时间修复：启动/恢复在会话锁内才读本段起点，等锁间隔不计入新计时段
+#
+# 同会话接纳等操作持锁时，控制请求先在会话锁上等待；修复前单调时钟在
+# 进锁前读取，成功后会把等锁时长叠加到游标、提前入队事件并消费 seq。
+# 以下用可控时钟 + 真实线程交错，分别回归启动、暂停恢复、阻塞恢复与
+# 无竞争路径。
+# ---------------------------------------------------------------------------
+
+
+class ControlledClock:
+    """可控单调时钟：内部以十进制精确秒（Decimal）累计，advance 后所有
+    读取方看到新值。
+
+    返回 Decimal 而非 float：管理器的耗时计算 int((now-base)*1000) 对任意
+    数值类型成立，而 Decimal 下 250ms/10ms/100ms 这类整毫秒的加减不会像
+    二进制浮点那样出现 9.10999… 被截成 109ms 的偏差，线程交错回归才能
+    精确断言游标。
+    """
+
+    def __init__(self, start=0.0):
+        self._value = Decimal(str(start))
+        self._cv = threading.Condition()
+
+    def __call__(self):
+        with self._cv:
+            return self._value
+
+    def advance(self, seconds):
+        with self._cv:
+            self._value += Decimal(str(seconds))
+
+    @property
+    def value(self):
+        with self._cv:
+            return self._value
+
+
+class TracedLock:
+    """在既有 threading.Lock 外记录“此刻有多少线程在等待本锁”。
+
+    必须包在会话**原有**的锁外面（而不是新建一把锁），持锁线程与生产
+    代码争用的才是同一把锁，等锁交错才真实。不改变互斥语义，供线程交错
+    测试可靠等待到“控制请求已在锁上排队”（避免用固定 sleep 猜调度）。
+    """
+
+    def __init__(self, inner):
+        self._lock = inner
+        self._state_lock = threading.Lock()
+        self._waiters = 0
+
+    def acquire(self, *args, **kwargs):
+        with self._state_lock:
+            self._waiters += 1
+        try:
+            return self._lock.acquire(*args, **kwargs)
+        finally:
+            with self._state_lock:
+                self._waiters -= 1
+
+    def release(self):
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+
+    @property
+    def waiters(self):
+        with self._state_lock:
+            return self._waiters
+
+
+def _wait_waiters(traced, count, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if traced.waiters == count:
+            return
+        time.sleep(0.001)
+    assert traced.waiters == count, traced.waiters
+
+
+def _clock_manager(limit=1024):
+    """可控时钟 + 无后台线程的管理器（等锁期不会有 tick 干扰）。"""
+    clock = ControlledClock()
+    pm = PlaybackManager(
+        channel_event_limit=limit,
+        autoplay_tick_interval_s=None,
+        clock=clock,
+    )
+    return pm, clock
+
+
+def _one_subtitle_record(scene_id="scene-lockfix", enter_ms=100, end_ms=500):
+    """单条非零时刻字幕（100ms 进入），游标 0 时无初始活动字幕。"""
+    subs = [{"id": "s1", "speaker": "A",
+             "start_ms": enter_ms, "end_ms": end_ms}]
+    return _record(scene_id, subs)
+
+
+def test_start_reads_clock_inside_lock_wait_not_counted():
+    """启动：接纳持锁 250ms 期间，启动在锁上等待；成功后 10ms 一拍游标
+    应只到 10，100ms 的字幕既不入队也不消费 seq（修复前会直接到 260）。
+    """
+    pm, clock = _clock_manager()
+    record = _one_subtitle_record("scene-lockfix-start")
+    s = _open_session(pm, record)
+    inner = s.lock
+    traced = TracedLock(inner)
+    s.lock = traced
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def load_gated():
+        # 接纳在会话锁内读取场景：让它持锁直到测试放行
+        entered.set()
+        release.wait(timeout=5)
+        return record
+
+    def accept_in_thread():
+        pm.accept(s, load_gated)
+
+    holder = threading.Thread(target=accept_in_thread)
+    holder.start()
+    entered.wait(timeout=3)
+
+    def start_in_thread():
+        pm.start_autoplay(s)  # 缺省 now：在锁内读取可控时钟
+
+    control = threading.Thread(target=start_in_thread)
+    control.start()
+    _wait_waiters(traced, 1)  # 启动请求已在锁上排队
+
+    # 等锁期间墙钟（可控时钟）走过 250ms——修复后不计入本段
+    clock.advance(0.250)
+    release.set()
+    holder.join(timeout=3)
+    control.join(timeout=3)
+    assert s.autoplay_status == AUTOPLAY_RUNNING
+    assert s.base_monotonic_s == 0.250  # 起点取的是进锁后的时钟
+    s.lock = inner
+
+    # 成功后再推进 10ms：目标 = 0 + int(10ms) = 10
+    clock.advance(0.010)
+    pm.tick_autoplay()
+    assert s.cursor_ms == 10
+    assert _queued(pm, s) == []  # 100ms 字幕未进入窗口：未入队
+    assert s.channel.next_seq == 1  # 未消费任何 seq
+
+    # 继续到 100ms 之后，字幕才正常进入（接续 seq 1，事件时刻仍是 100）
+    clock.advance(0.095)
+    pm.tick_autoplay()
+    assert s.cursor_ms == 105
+    queued = _queued(pm, s)
+    assert [(e["seq"], e["time_ms"], e["type"]) for e in queued] == [
+        (1, 100, "enter")
+    ]
+
+
+def test_resume_from_pause_reads_clock_inside_lock_wait_not_counted():
+    """暂停恢复：恢复请求在锁上等待 250ms，成功后 10ms 一拍只到保留
+    游标 +10，停顿/等锁期间 100ms 的字幕事件不提前入队、不消费 seq。
+    """
+    pm, clock = _clock_manager()
+    # 字幕在暂停之后（>50ms）才进入，等锁/恢复窗口是否计时直接决定结果
+    record = _one_subtitle_record("scene-lockfix-resume", enter_ms=100)
+    s = _open_session(pm, record)
+
+    # running 段推进到 50 后暂停（保留游标 50），字幕尚未进入
+    pm.start_autoplay(s)  # 锁内读钟：起点 0
+    clock.advance(0.050)
+    pm.tick_autoplay()
+    assert s.cursor_ms == 50
+    assert pm.pause_autoplay(s)["status"] == AUTOPLAY_PAUSED
+    clock.advance(5.0)  # 暂停期间钟再走也不计时
+
+    inner = s.lock
+    traced = TracedLock(inner)
+    s.lock = traced
+    holder_ready = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        with inner:
+            holder_ready.set()
+            release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    holder_ready.wait(timeout=3)
+
+    def resume_in_thread():
+        pm.resume_autoplay(s)
+
+    control = threading.Thread(target=resume_in_thread)
+    control.start()
+    _wait_waiters(traced, 1)
+    clock.advance(0.250)  # 等锁 250ms 不计入恢复后的新一段
+    release.set()
+    holder.join(timeout=3)
+    control.join(timeout=3)
+    s.lock = inner
+    assert s.autoplay_status == AUTOPLAY_RUNNING
+    assert s.base_cursor_ms == 50
+    assert s.base_monotonic_s == clock.value
+
+    # 恢复后只走 10ms：游标 60；100ms 字幕不得入队或消费 seq
+    clock.advance(0.010)
+    pm.tick_autoplay()
+    assert s.cursor_ms == 60
+    assert _queued(pm, s) == []
+    assert s.channel.next_seq == 1
+
+    # 走到 100ms 之后才正常进入
+    clock.advance(0.045)
+    pm.tick_autoplay()
+    assert s.cursor_ms == 105
+    assert [(e["seq"], e["time_ms"], e["type"]) for e in _queued(pm, s)] == [
+        (1, 100, "enter")
+    ]
+
+
+def test_resume_from_blocked_reads_clock_inside_lock_wait_not_counted():
+    """阻塞恢复：满额 blocked 后释放容量；恢复请求等锁 250ms 不计入，
+    成功后 10ms 一拍只到保留游标 +10；等锁期间的事件不提前整批入队，
+    seq 与队列在等锁期间保持不变。
+    """
+    pm, clock = _clock_manager(limit=10)
+    # 本会话字幕：100 进入（首批，阻塞前已入队 seq1）；105～117 四条
+    # 短字幕的进入/退出全在恢复后的窗口里（共 8 条）。
+    s = _open_session(pm, _record("scene-lockfix-block", _two_batch_subtitles()))
+
+    # 占额会话：9 条进入（10..90ms）占满 9 个名额，总容量 10
+    hog_subs = [
+        {"id": f"h{i}", "speaker": f"H{i}",
+         "start_ms": 10 + i * 10, "end_ms": 10 + i * 10 + 500}
+        for i in range(9)
+    ]
+    hog = _open_session(pm, _record("scene-lockfix-hog", hog_subs))
+    pm.advance_events(hog, 90)
+    assert pm.channel_capacity.used == 9
+
+    # 首批 100ms：early enter 恰好入队（used=10）；下一拍整批 8 条 -> blocked
+    pm.start_autoplay(s)
+    clock.advance(0.100)
+    pm.tick_autoplay()
+    assert s.cursor_ms == 100
+    assert [e["seq"] for e in _queued(pm, s)] == [1]
+    clock.advance(0.010)
+    pm.tick_autoplay()
+    assert s.autoplay_status == AUTOPLAY_BLOCKED
+    assert s.cursor_ms == 100
+
+    # 确认 seq1 释放 1 个名额（used=9，占额会话仍在），再结束占额会话
+    # 释放 9 个：容量全空；会话仍 blocked，等待显式恢复
+    pm.fetch_channel(s, 1)
+    pm.finish(hog.session_id)
+    assert pm.channel_capacity.used == 0
+    assert s.autoplay_status == AUTOPLAY_BLOCKED
+
+    inner = s.lock
+    traced = TracedLock(inner)
+    s.lock = traced
+    holder_ready = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        with inner:
+            holder_ready.set()
+            release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    holder_ready.wait(timeout=3)
+
+    def resume_in_thread():
+        pm.resume_autoplay(s)
+
+    control = threading.Thread(target=resume_in_thread)
+    control.start()
+    _wait_waiters(traced, 1)
+    clock.advance(0.250)  # 等锁 250ms：游标、seq、队列一律不变
+    assert s.cursor_ms == 100
+    assert [e["seq"] for e in _queued(pm, s)] == []
+    assert s.channel.next_seq == 2
+    release.set()
+    holder.join(timeout=3)
+    control.join(timeout=3)
+    s.lock = inner
+    assert s.base_cursor_ms == 100
+    assert s.base_monotonic_s == clock.value
+
+    # 恢复后 10ms 的拍目标 110：窗口 (100,110] 含 late0 enter@105、
+    # late0 exit@107、late1 enter@109 与 early exit@110，共 4 条，从 seq 2
+    # 起连续入队（修复前等锁 250ms 会被计入，目标直接到 360、整批 9 条
+    # 提前入队）。
+    clock.advance(0.010)
+    pm.tick_autoplay()
+    assert s.autoplay_status == AUTOPLAY_RUNNING
+    assert s.cursor_ms == 110
+    queued = _queued(pm, s)
+    assert [e["seq"] for e in queued] == [2, 3, 4, 5]
+    assert [(e["time_ms"], e["type"], e["id"]) for e in queued] == [
+        (105, "enter", "late0"),
+        (107, "exit", "late0"),
+        (109, "enter", "late1"),
+        (110, "exit", "early"),
+    ]
+
+    # 再走一拍越过全部事件：剩余事件接续 seq 6 完整入队，游标继续从
+    # 恢复后的本段计时（100 + 260 = 360），而非被等锁时间二次放大
+    clock.advance(0.250)
+    pm.tick_autoplay()
+    assert s.autoplay_status == AUTOPLAY_RUNNING
+    assert s.cursor_ms == 360
+    queued = _queued(pm, s)
+    assert [e["seq"] for e in queued] == list(range(2, 11))
+
+
+def test_controlled_clock_no_contention_paths():
+    """无竞争路径：注入时钟下启动/恢复照常从进锁时钟开新计时段；
+    显式 now= 注入（既有确定性接口）保持可用，暂停/阻塞语义不变。
+    """
+    pm, clock = _clock_manager()
+    s = _open_session(pm, _one_subtitle_record("scene-lockfix-nocont"))
+
+    # 无竞争启动：起点就是当前可控时钟 0
+    pm.start_autoplay(s)
+    assert s.base_monotonic_s == 0.0
+    clock.advance(0.010)
+    pm.tick_autoplay()
+    assert s.cursor_ms == 10
+    assert _queued(pm, s) == []
+
+    # 暂停后恢复（无竞争）：新一段起点取进锁时的时钟，保留游标不变
+    pm.pause_autoplay(s)
+    assert s.cursor_ms == 10
+    clock.advance(9.0)  # 暂停期间不计时
+    pm.resume_autoplay(s)
+    assert s.base_cursor_ms == 10
+    assert s.base_monotonic_s == clock.value
+    clock.advance(0.100)
+    pm.tick_autoplay()
+    # 10 + 100 = 110，不追赶暂停的 9 秒；100ms 字幕此刻才进入
+    assert s.cursor_ms == 110
+    assert [(e["seq"], e["time_ms"]) for e in _queued(pm, s)] == [(1, 100)]
+
+    # 既有显式 now= 注入仍然有效（另起一会话验证；起点取 0 避免相近
+    # 二进制浮点相减的整毫秒截断）
+    pm2 = PlaybackManager(autoplay_tick_interval_s=None)
+    s2 = _open_session(
+        pm2, _one_subtitle_record("scene-lockfix-explicit")
+    )
+    pm2.start_autoplay(s2, now=0.0)
+    assert s2.base_monotonic_s == 0.0
+    pm2.tick_autoplay(now=0.010)
+    assert s2.cursor_ms == 10
+
+
+def test_start_lock_wait_not_counted_over_http(monkeypatch):
+    """HTTP 路径回归：同会话接纳持锁时启动等锁 250ms，成功后显式一拍只
+    推进 10ms，100ms 字幕不入队、不消费 seq；运行中手动推进仍 409。
+    """
+    pm, clock = _clock_manager()
+    monkeypatch.setattr(main_module, "_playback", pm)
+    client = TestClient(app)
+    sid = make_session(
+        client, "scene-lockfix-http",
+        subtitles=[{"id": "s1", "speaker": "A",
+                    "start_ms": 100, "end_ms": 500}],
+    )
+    open_channel(client, sid)
+    session = pm.get(sid)
+
+    inner = session.lock
+    traced = TracedLock(inner)
+    session.lock = traced
+    holder_ready = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        with inner:
+            holder_ready.set()
+            release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    holder_ready.wait(timeout=3)
+
+    def start_request():
+        start(client, sid)
+
+    control = threading.Thread(target=start_request)
+    control.start()
+    _wait_waiters(traced, 1)
+    clock.advance(0.250)  # 等锁 250ms
+    release.set()
+    holder.join(timeout=3)
+    control.join(timeout=3)
+    session.lock = inner
+
+    # 显式驱动一拍（无后台线程）：只前进 10ms
+    clock.advance(0.010)
+    pm.tick_autoplay()
+    body = status(client, sid)
+    assert body["status"] == "running"
+    assert body["cursor_ms"] == 10
+    # 100ms 字幕未入队、seq 未被消费
+    queued = fetch(client, sid, 0).json()["events"]
+    assert queued == []
+    # 运行中手动推进仍是 409
+    resp = client.post(
+        f"/sessions/{sid}/advance", json={"time_ms": 9999}
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "manual_advance_while_running"
+    client.post(f"/sessions/{sid}/finish")
 
 
 
