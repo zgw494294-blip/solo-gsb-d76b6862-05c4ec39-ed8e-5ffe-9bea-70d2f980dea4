@@ -662,6 +662,325 @@ def test_deterministic_manual_advance_409_only_while_running():
     assert b.cursor_ms == 100
 
 
+# ---------------------------------------------------------------------------
+# 等锁不计时回归：可控时钟 + 线程交错
+#
+# 修复前启动/恢复在进入会话锁“之前”读取单调时钟：同会话接纳等操作持锁时，
+# 控制请求先取时再等待，锁外等待的时长被计入本段计时——生效后游标会额外
+# 推进等待时长，并提前入队字幕事件。修复后时钟在会话锁内、状态迁移生效的
+# 同一时刻读取。下面用可控时钟与“接纳持锁”的线程交错覆盖：启动、暂停
+# 恢复、阻塞恢复与无竞争路径。
+# ---------------------------------------------------------------------------
+
+
+class FakeClock:
+    """可控单调时钟：按毫秒步进，由管理器在会话锁内读取。"""
+
+    def __init__(self, now_s=0.0):
+        self._now_s = now_s
+        self._lock = threading.Lock()
+
+    def __call__(self):
+        with self._lock:
+            return self._now_s
+
+    def advance_ms(self, ms):
+        with self._lock:
+            self._now_s += ms / 1000.0
+
+
+class AcceptHoldingLock:
+    """在会话锁内阻塞的接纳：模拟同会话接纳持锁，让控制请求排队等锁。
+
+    accept 的 load_record 回调在会话锁内执行：进入后等待主线程放行，
+    持锁期间同会话的启动/恢复请求只能在锁外排队。
+    """
+
+    def __init__(self, pm, session, record):
+        self._pm = pm
+        self._session = session
+        self._record = record
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.error = None
+
+    def _load(self):
+        self.entered.set()
+        assert self.release.wait(timeout=5)
+        return self._record
+
+    def _run(self):
+        try:
+            self._pm.accept(self._session, self._load)
+        except Exception as exc:  # pragma: no cover - 失败即测试缺陷
+            self.error = exc
+
+    def __enter__(self):
+        self.thread.start()
+        assert self.entered.wait(timeout=5)
+        return self
+
+    def __exit__(self, *exc_info):
+        self.release.set()
+        self.thread.join(timeout=5)
+        assert not self.thread.is_alive()
+        assert self.error is None
+        return False
+
+
+def _record_tracks(scene_id, subtitles, tracks):
+    """显式指定轨道的场景快照（轨道与字幕按下标对齐）。"""
+    subs = [dict(s) for s in subtitles]
+    return SceneRecord(
+        scene_id=scene_id,
+        revision=1,
+        track_count=2,
+        subtitles=subs,
+        assignments=[
+            {"id": s["id"], "track": t} for s, t in zip(subs, tracks)
+        ],
+        changes=0,
+    )
+
+
+def _clock_manager(clock, limit=16):
+    return PlaybackManager(
+        channel_event_limit=limit,
+        autoplay_tick_interval_s=None,
+        clock=clock,
+    )
+
+
+def test_start_does_not_count_lock_wait():
+    """启动等锁不计时：游标 0、等锁 250ms，生效后 10ms 推进一拍，游标为 10。
+
+    修复前启动在锁外读时钟，250ms 等锁被计入，首拍目标会变成 260 并把
+    100ms 字幕的 enter/exit 提前入队。
+    """
+    clock = FakeClock()
+    pm = _clock_manager(clock)
+    record = _record_tracks(
+        "scene-lock-start",
+        [
+            {"id": "a", "speaker": "A", "start_ms": 0, "end_ms": 5000},
+            {"id": "b", "speaker": "B", "start_ms": 100, "end_ms": 200},
+        ],
+        [1, 2],
+    )
+    s = _open_session(pm, record)
+
+    started = {}
+    with AcceptHoldingLock(pm, s, record):
+        worker = threading.Thread(
+            target=lambda: started.update(pm.start_autoplay(s)), daemon=True
+        )
+        worker.start()
+        time.sleep(0.05)  # 让启动请求在锁外排队
+        clock.advance_ms(250)  # 等锁 250ms：不得计入计时段
+    worker.join(timeout=5)
+    assert started == {
+        "session_id": s.session_id,
+        "status": AUTOPLAY_RUNNING,
+        "cursor_ms": 0,
+    }
+    # 计时段从串行生效时刻（等锁之后）起算，而不是从进入锁之前起算
+    assert s.base_monotonic_s == clock()
+
+    clock.advance_ms(10)
+    pm.tick_autoplay()
+    assert s.cursor_ms == 10  # 而非 260
+    # 100ms 字幕不得入队、不得消耗 seq
+    assert _queued(pm, s) == []
+    assert s.channel.next_seq == 1
+
+
+def test_resume_from_pause_does_not_count_lock_wait():
+    """暂停恢复等锁不计时：保留游标 100、等锁 250ms，生效后 +10ms 到 110。"""
+    clock = FakeClock()
+    pm = _clock_manager(clock)
+    record = _record_tracks(
+        "scene-lock-pause",
+        [
+            {"id": "a", "speaker": "A", "start_ms": 0, "end_ms": 5000},
+            {"id": "b", "speaker": "B", "start_ms": 100, "end_ms": 200},
+            {"id": "c", "speaker": "C", "start_ms": 300, "end_ms": 400},
+        ],
+        [1, 2, 2],
+    )
+    s = _open_session(pm, record)
+    pm.start_autoplay(s)  # 时钟 0：无竞争启动
+    clock.advance_ms(100)
+    pm.tick_autoplay()  # 游标 100，b enter 入队为 seq1
+    assert s.cursor_ms == 100
+    assert [e["seq"] for e in _queued(pm, s)] == [1]
+    pm.pause_autoplay(s)
+
+    resumed = {}
+    with AcceptHoldingLock(pm, s, record):
+        worker = threading.Thread(
+            target=lambda: resumed.update(pm.resume_autoplay(s)), daemon=True
+        )
+        worker.start()
+        time.sleep(0.05)  # 让恢复请求在锁外排队
+        clock.advance_ms(250)  # 等锁 250ms：不得计入新一段
+    worker.join(timeout=5)
+    assert resumed["status"] == AUTOPLAY_RUNNING
+    assert resumed["cursor_ms"] == 100
+    assert s.base_monotonic_s == clock()
+
+    clock.advance_ms(10)
+    pm.tick_autoplay()
+    assert s.cursor_ms == 110  # 而非 360
+    # 300ms 的 c 不得提前入队；队列仍只有 seq1，seq 未被消耗
+    assert [e["seq"] for e in _queued(pm, s)] == [1]
+    assert s.channel.next_seq == 2
+
+
+def test_resume_from_blocked_does_not_count_lock_wait():
+    """阻塞恢复等锁不计时：保留游标 100、等锁 250ms，生效后 +10ms 到 110。"""
+    clock = FakeClock()
+    pm = _clock_manager(clock, limit=1)
+    record = _record_tracks(
+        "scene-lock-block",
+        [
+            {"id": "a", "speaker": "A", "start_ms": 100, "end_ms": 5000},
+            {"id": "b", "speaker": "B", "start_ms": 300, "end_ms": 4000},
+        ],
+        [1, 2],
+    )
+    s = _open_session(pm, record)
+    pm.start_autoplay(s)  # 时钟 0
+    clock.advance_ms(100)
+    pm.tick_autoplay()  # a enter@100 入队为 seq1，占满容量（limit=1）
+    assert s.cursor_ms == 100
+    clock.advance_ms(300)
+    pm.tick_autoplay()  # 整批 b enter@300 放不下 -> blocked，游标/seq/队列不变
+    assert s.autoplay_status == AUTOPLAY_BLOCKED
+    assert s.cursor_ms == 100
+    assert pm.channel_capacity.used == 1
+
+    # 确认释放容量（先读建立已返回上界，再确认删除前缀）
+    assert [e["seq"] for e in _queued(pm, s)] == [1]
+    pm.fetch_channel(s, 1)
+    assert pm.channel_capacity.used == 0
+
+    resumed = {}
+    with AcceptHoldingLock(pm, s, record):
+        worker = threading.Thread(
+            target=lambda: resumed.update(pm.resume_autoplay(s)), daemon=True
+        )
+        worker.start()
+        time.sleep(0.05)  # 让恢复请求在锁外排队
+        clock.advance_ms(250)  # 等锁 250ms：不得计入新一段
+    worker.join(timeout=5)
+    assert resumed["status"] == AUTOPLAY_RUNNING
+    assert s.base_monotonic_s == clock()
+
+    clock.advance_ms(10)
+    pm.tick_autoplay()
+    assert s.autoplay_status == AUTOPLAY_RUNNING
+    assert s.cursor_ms == 110  # 而非 360
+    # b@300 未提前入队；容量充足但窗口 (100,110] 内无事件
+    assert _queued(pm, s) == []
+    assert s.channel.next_seq == 2  # seq 未消耗
+
+
+def test_start_pause_resume_without_contention_unchanged():
+    """无竞争路径：锁内读时钟与既有行为一致；注入 now 仍优先于管理器时钟。"""
+    clock = FakeClock()
+    pm = _clock_manager(clock)
+    record = _record_tracks(
+        "scene-lock-free",
+        [{"id": "a", "speaker": "A", "start_ms": 0, "end_ms": 5000}],
+        [1],
+    )
+    s = _open_session(pm, record)
+    pm.start_autoplay(s)  # 无等锁：立即读到时钟 0
+    assert s.base_monotonic_s == 0.0
+    clock.advance_ms(50)
+    pm.tick_autoplay()
+    assert s.cursor_ms == 50
+    pm.pause_autoplay(s)
+    clock.advance_ms(1000)  # 暂停不计时
+    pm.resume_autoplay(s)  # 无等锁：立即读到当前时钟
+    assert s.base_monotonic_s == clock()
+    clock.advance_ms(50)
+    pm.tick_autoplay()
+    assert s.cursor_ms == 100  # 50 + 50，不追赶暂停的 1000ms
+    pm.finish(s.session_id)
+
+    # 保留时钟注入：显式 now 优先于管理器时钟（此时受控时钟在 1.1s）
+    s2 = _open_session(
+        pm,
+        _record_tracks(
+            "scene-lock-free-2",
+            [{"id": "a", "speaker": "A", "start_ms": 0, "end_ms": 5000}],
+            [1],
+        ),
+    )
+    pm.start_autoplay(s2, now=100.0)
+    assert s2.base_monotonic_s == 100.0
+    pm.tick_autoplay(now=100.5)
+    assert s2.cursor_ms == 500
+
+
+def test_http_start_does_not_count_lock_wait(monkeypatch):
+    """HTTP 层面回归：启动请求等锁 250ms 不计入，生效后 10ms 游标为 10。
+
+    受控时钟注入单例管理器；主线程直接持会话锁模拟同会话操作（如进行中
+    的接纳），另一线程经 HTTP 发起启动。
+    """
+    clock = FakeClock()
+    pm = _clock_manager(clock)
+    monkeypatch.setattr(main_module, "_playback", pm)
+    client = TestClient(app)
+    sid = make_session(
+        client,
+        "scene-auto-lockwait",
+        subtitles=[
+            {"id": "a", "speaker": "A", "start_ms": 0, "end_ms": 5000},
+            {"id": "b", "speaker": "B", "start_ms": 100, "end_ms": 200},
+        ],
+    )
+    open_channel(client, sid)
+    session = pm.get(sid)
+
+    responses = []
+    session.lock.acquire()  # 模拟同会话操作持锁
+    try:
+        worker = threading.Thread(
+            target=lambda: responses.append(
+                TestClient(app).post(f"/sessions/{sid}/autoplay/start")
+            ),
+            daemon=True,
+        )
+        worker.start()
+        time.sleep(0.05)  # 让启动请求在锁外排队
+        clock.advance_ms(250)  # 等锁 250ms：不得计入计时段
+    finally:
+        session.lock.release()
+    worker.join(timeout=5)
+    assert responses[0].status_code == 200
+    assert responses[0].json() == {
+        "session_id": sid,
+        "status": "running",
+        "cursor_ms": 0,
+    }
+
+    clock.advance_ms(10)
+    pm.tick_autoplay()  # 生效后 10ms 推进一拍
+    assert status(client, sid) == {
+        "session_id": sid,
+        "status": "running",
+        "cursor_ms": 10,
+    }
+    # 100ms 字幕未入队、未消耗 seq
+    assert fetch(client, sid, 0).json()["events"] == []
+    assert session.channel.next_seq == 1
+    client.post(f"/sessions/{sid}/finish")
+
+
 
 def test_blocked_resumes_after_capacity_is_available(monkeypatch):
     """上限足够大时：确认释放并显式恢复后，整批成功，事件接续旧 seq。"""

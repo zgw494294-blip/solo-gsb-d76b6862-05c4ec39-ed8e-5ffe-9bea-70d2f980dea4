@@ -53,9 +53,13 @@
   播放，客户端不再逐次提交推进时间。进程内唯一的守护驱动线程每 50ms
   尝试推进一次，目标游标 = 本段起始游标 + 自本段起点单调时钟
   （time.monotonic）经过的整毫秒；暂停、阻塞不计时，恢复以保留游标作为
-  新一段起点重新计时，不追赶停顿时间。后台推进沿用事件窗口、隐藏过滤、
-  排序、seq 与共享容量的全部既有规则：一次推进整批入队，容量不足整批
-  转为 blocked——游标、seq 与队列保持原样，确认释放容量后须显式恢复。
+  新一段起点重新计时，不追赶停顿时间。启动与恢复的单调时钟起点在
+  **会话锁内、状态迁移生效的同一时刻**读取：控制请求在锁外排队等待
+  （例如同会话的接纳正持锁）的时间不计入计时段，成功生效后不会把等锁
+  间隔额外推进到游标上，也不会因此提前入队字幕事件。后台推进沿用事件
+  窗口、隐藏过滤、排序、seq 与共享容量的全部既有规则：一次推进整批
+  入队，容量不足整批转为 blocked——游标、seq 与队列保持原样，确认
+  释放容量后须显式恢复。
   控制接口为启动（start，仅 idle 且已开通道）、暂停（pause，仅 running）、
   恢复（resume，仅 paused/blocked）与查询（status，返回 idle/running/
   paused/blocked 与游标）；状态不符抛 AutoplayConflict（HTTP 409），
@@ -351,8 +355,9 @@ class PlaybackSession:
     # 自动播放驱动状态（仅内存态，不跨重启保留）：
     # autoplay_status 取 idle/running/paused/blocked；base_cursor_ms 为本段
     # 起始游标（启动时的当前游标，或暂停/阻塞保留的游标）；base_monotonic_s
-    # 为本段起点的单调时钟读数（time.monotonic()）。暂停与阻塞不计时——
-    # 恢复时以保留游标作为新一段的起点重新计时，不追赶停顿时间。
+    # 为本段起点的单调时钟读数——在会话锁内、状态迁移生效的同一时刻读取，
+    # 控制请求等锁的时间不计入。暂停与阻塞不计时——恢复时以保留游标作为
+    # 新一段的起点重新计时，不追赶停顿时间。
     autoplay_status: str = AUTOPLAY_IDLE
     base_cursor_ms: int = 0
     base_monotonic_s: float = 0.0
@@ -476,6 +481,7 @@ class PlaybackManager:
         self,
         channel_event_limit: Optional[int] = None,
         autoplay_tick_interval_s: Optional[float] = AUTOPLAY_TICK_INTERVAL_S,
+        clock: Optional[Callable[[], float]] = None,
     ) -> None:
         self._sessions: Dict[str, PlaybackSession] = {}
         self._registry_lock = threading.Lock()
@@ -485,6 +491,10 @@ class PlaybackManager:
             )
         # 单进程内所有会话的补取通道共用同一份未确认事件容量。
         self._channel_capacity = ChannelCapacity(channel_event_limit)
+        # 单调时钟（秒）：启动/恢复在会话锁内、状态迁移生效的同一时刻读取，
+        # 在锁外排队等待的时间不计入计时段；测试可注入可控时钟，
+        # 生产默认 time.monotonic。
+        self._clock = clock if clock is not None else time.monotonic
         # 自动播放后台驱动：进程内唯一的守护线程，每 tick 间隔（默认 50ms）
         # 对所有运行中的会话尝试推进一次。驱动状态只存于本进程内存。
         # autoplay_tick_interval_s=None 表示不启动后台线程（仅显式 tick，
@@ -815,15 +825,16 @@ class PlaybackManager:
     ) -> None:
         """对单个会话尝试推进一拍（仅 running 生效）。
 
-        now 可注入单调时钟读数（秒）以便确定性测试；缺省取 time.monotonic()。
-        目标游标 = 本段起始游标 + 自本段起点经过的整毫秒；暂停、阻塞不计时
-        （它们已把状态移出 running），恢复从保留游标开新一段。目标不大于
-        当前游标（首拍不足 1ms）时不做任何变更。一次推进把整批事件原子
-        入队：共享容量不足时整批转为 blocked——游标、seq 与队列保持原样，
-        确认释放容量后须显式 resume，不追赶停顿时间。
+        now 可注入单调时钟读数（秒）以便确定性测试；缺省取管理器时钟
+        （生产为 time.monotonic()）。目标游标 = 本段起始游标 + 自本段起点
+        经过的整毫秒；暂停、阻塞不计时（它们已把状态移出 running），恢复
+        从保留游标开新一段。目标不大于当前游标（首拍不足 1ms）时不做任何
+        变更。一次推进把整批事件原子入队：共享容量不足时整批转为
+        blocked——游标、seq 与队列保持原样，确认释放容量后须显式
+        resume，不追赶停顿时间。
         """
         if now is None:
-            now = time.monotonic()
+            now = self._clock()
         with session.lock:
             if session.closed:
                 raise SessionFinished(session.session_id)
@@ -861,13 +872,14 @@ class PlaybackManager:
         """启动自动播放：仅限已开启补取通道且从未启动的会话。
 
         以当前游标为本段起始游标记录单调时钟起点并置为 running，后台驱动
-        随即按真实经过时间推进（确定性模式下由显式 tick 驱动）。未开启
-        通道抛 AutoplayConflict(channel_missing)；已启动（含 running/
-        paused/blocked）抛 AutoplayConflict(already_started)；会话已结束
-        抛 SessionFinished。
+        随即按真实经过时间推进（确定性模式下由显式 tick 驱动）。时钟在
+        **会话锁内、状态迁移生效的同一时刻**读取：若同一会话的接纳等操作
+        正持锁，本请求在锁外排队等待的时间不属于本段计时——生效时刻才
+        开新计时段，随后的推进不会把等锁间隔算进去，也就不会提前入队
+        字幕事件。未开启通道抛 AutoplayConflict(channel_missing)；已启动
+        （含 running/paused/blocked）抛 AutoplayConflict(already_started)；
+        会话已结束抛 SessionFinished。
         """
-        if now is None:
-            now = time.monotonic()
         with session.lock:
             if session.closed:
                 raise SessionFinished(session.session_id)
@@ -879,6 +891,10 @@ class PlaybackManager:
                 raise AutoplayConflict(
                     "already_started", session.autoplay_status
                 )
+            # 串行生效点：此刻才读取时钟开新计时段（注入 now 时按注入值），
+            # 此前在会话锁外等待的时间不计入。
+            if now is None:
+                now = self._clock()
             session.autoplay_status = AUTOPLAY_RUNNING
             session.base_cursor_ms = session.cursor_ms
             session.base_monotonic_s = now
@@ -913,13 +929,13 @@ class PlaybackManager:
         """恢复自动播放：仅限 paused 或 blocked；从保留游标重新计时。
 
         以当前（保留的）游标作为新一段起点重新记录单调时钟，不追赶暂停或
-        阻塞期间流逝的时间。阻塞恢复后若容量仍不足，下一拍（注入 now 的
-        显式 tick 或后台线程的下一拍）会再次整批失败并回到 blocked（游标、
-        seq、队列不变）。未启动抛 not_started；running 抛
-        resume_paused_or_blocked。
+        阻塞期间流逝的时间。与启动相同，时钟在**会话锁内、状态迁移生效的
+        同一时刻**读取：本请求在锁外排队等待（例如同会话的接纳正持锁）的
+        时间不计入新一段，恢复后的推进不会把等锁间隔算进去。阻塞恢复后若
+        容量仍不足，下一拍（注入 now 的显式 tick 或后台线程的下一拍）会
+        再次整批失败并回到 blocked（游标、seq、队列不变）。未启动抛
+        not_started；running 抛 resume_paused_or_blocked。
         """
-        if now is None:
-            now = time.monotonic()
         with session.lock:
             if session.closed:
                 raise SessionFinished(session.session_id)
@@ -928,6 +944,10 @@ class PlaybackManager:
                 raise AutoplayConflict("not_started", status)
             if status not in (AUTOPLAY_PAUSED, AUTOPLAY_BLOCKED):
                 raise AutoplayConflict("resume_paused_or_blocked", status)
+            # 串行生效点：此刻才读取时钟开新计时段（注入 now 时按注入值），
+            # 此前在会话锁外等待的时间不计入。
+            if now is None:
+                now = self._clock()
             session.autoplay_status = AUTOPLAY_RUNNING
             session.base_cursor_ms = session.cursor_ms
             session.base_monotonic_s = now
